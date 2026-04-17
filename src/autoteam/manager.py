@@ -33,6 +33,7 @@ from autoteam.accounts import (
     STATUS_PENDING,
     STATUS_STANDBY,
     add_account,
+    advance_reuse_cursor,
     find_account,
     get_standby_accounts,
     load_accounts,
@@ -1509,7 +1510,11 @@ def reinvite_account(chatgpt_api, mail_client, acc):
 
     auth_file = save_auth_file(bundle)
     update_account(email, status=STATUS_ACTIVE, last_active_at=time.time(), auth_file=auth_file)
-    logger.info("[轮转] 旧账号已恢复: %s", email)
+    next_email = advance_reuse_cursor(email)
+    if next_email:
+        logger.info("[轮转] 旧账号已恢复: %s（下次从 %s 开始）", email, next_email)
+    else:
+        logger.info("[轮转] 旧账号已恢复: %s", email)
     return True
 
 

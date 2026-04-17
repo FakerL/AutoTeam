@@ -1136,7 +1136,7 @@ def post_account_login(params: LoginAccountParams):
         raise HTTPException(status_code=404, detail="账号不存在")
 
     def _run():
-        from autoteam.accounts import STATUS_ACTIVE, update_account
+        from autoteam.accounts import STATUS_ACTIVE, advance_reuse_cursor, update_account
         from autoteam.cloudmail import CloudMailClient
         from autoteam.codex_auth import (
             check_codex_quota,
@@ -1155,6 +1155,8 @@ def post_account_login(params: LoginAccountParams):
             # 登录成功且是 team plan，自动标记为 active
             if bundle.get("plan_type") == "team":
                 update_account(email, status=STATUS_ACTIVE, last_active_at=time.time())
+                if acc.get("status") != STATUS_ACTIVE:
+                    advance_reuse_cursor(email)
                 # 查一下额度并保存快照
                 token = bundle.get("access_token")
                 if token:

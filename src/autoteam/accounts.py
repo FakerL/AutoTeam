@@ -9,6 +9,7 @@ from autoteam.textio import read_text, write_text
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 ACCOUNTS_FILE = PROJECT_ROOT / "accounts.json"
+ROTATION_STATE_FILE = PROJECT_ROOT / "rotation_state.json"
 
 # 账号状态
 STATUS_ACTIVE = "active"  # 在 team 中，额度可用
@@ -37,6 +38,62 @@ def load_accounts():
 def save_accounts(accounts):
     """保存账号列表"""
     write_text(ACCOUNTS_FILE, json.dumps(accounts, indent=2, ensure_ascii=False))
+
+
+def load_rotation_state():
+    """加载轮转游标状态。"""
+    if ROTATION_STATE_FILE.exists():
+        try:
+            text = read_text(ROTATION_STATE_FILE).strip()
+            if text:
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            return {}
+    return {}
+
+
+def save_rotation_state(state):
+    """保存轮转游标状态。"""
+    write_text(ROTATION_STATE_FILE, json.dumps(state, indent=2, ensure_ascii=False))
+
+
+def get_next_reuse_email():
+    """获取下次 standby 复用的起始邮箱。"""
+    value = load_rotation_state().get("next_reuse_email")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def set_next_reuse_email(email):
+    """保存下次 standby 复用的起始邮箱。"""
+    state = load_rotation_state()
+    normalized = (email or "").strip()
+    if normalized:
+        state["next_reuse_email"] = normalized
+    else:
+        state.pop("next_reuse_email", None)
+    save_rotation_state(state)
+    return normalized or None
+
+
+def advance_reuse_cursor(email):
+    """在账号总顺序中，把复用游标推进到当前邮箱的下一个账号。"""
+    ordered_accounts = [a for a in load_accounts() if not _is_main_account_email(a.get("email"))]
+    if not ordered_accounts:
+        return set_next_reuse_email(None)
+
+    current_idx = next(
+        (idx for idx, acc in enumerate(ordered_accounts) if _normalized_email(acc.get("email")) == _normalized_email(email)),
+        None,
+    )
+    if current_idx is None:
+        return get_next_reuse_email()
+
+    next_email = ordered_accounts[(current_idx + 1) % len(ordered_accounts)].get("email")
+    return set_next_reuse_email(next_email)
 
 
 def find_account(accounts, email):
@@ -101,9 +158,26 @@ def get_standby_accounts():
                 # 有恢复时间，看是否已过
                 a["_quota_recovered"] = now >= resets_at
             standby.append(a)
-    # 已恢复的排前面
-    standby.sort(key=lambda x: (not x.get("_quota_recovered", False), x.get("quota_exhausted_at") or 0))
-    return standby
+
+    next_reuse_email = get_next_reuse_email()
+    if standby and next_reuse_email:
+        order_map = {
+            _normalized_email(acc.get("email")): idx
+            for idx, acc in enumerate(accounts)
+            if not _is_main_account_email(acc.get("email"))
+        }
+        start_idx = order_map.get(_normalized_email(next_reuse_email))
+        if start_idx is not None and order_map:
+            standby.sort(
+                key=lambda acc: (
+                    order_map.get(_normalized_email(acc.get("email")), len(order_map)) - start_idx
+                )
+                % len(order_map)
+            )
+
+    recovered = [acc for acc in standby if acc.get("_quota_recovered", False)]
+    unrecovered = [acc for acc in standby if not acc.get("_quota_recovered", False)]
+    return recovered + unrecovered
 
 
 def get_next_reusable_account():
