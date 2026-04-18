@@ -298,10 +298,13 @@ def _print_status_table(accounts, quota_cache=None):
     )
 
 
-def cmd_status():
-    """显示所有账号状态（先同步 Team 实际状态，active 账号实时查询额度）"""
-    logger.info("[状态] 同步 Team 实际状态...")
-    sync_account_states()
+def cmd_status(cached: bool = False):
+    """显示所有账号状态。cached 模式下只读本地缓存，不做外部探测。"""
+    if cached:
+        logger.info("[状态] 使用缓存模式：跳过配置验证、Team 同步和实时额度查询")
+    else:
+        logger.info("[状态] 同步 Team 实际状态...")
+        sync_account_states()
 
     accounts = load_accounts()
     if not accounts:
@@ -310,23 +313,24 @@ def cmd_status():
 
     # active 账号实时查询额度
     quota_cache = {}
-    active_count = sum(
-        1 for a in accounts if a["status"] == STATUS_ACTIVE and a.get("auth_file") and Path(a["auth_file"]).exists()
-    )
-    if active_count:
-        logger.info("[状态] 查询 %d 个 active 账号额度...", active_count)
-    for acc in accounts:
-        if acc["status"] == STATUS_ACTIVE and acc.get("auth_file") and Path(acc["auth_file"]).exists():
-            auth_data = json.loads(read_text(Path(acc["auth_file"])))
-            access_token = auth_data.get("access_token")
-            if access_token:
-                status, info = check_codex_quota(access_token)
-                if status == "ok" and isinstance(info, dict):
-                    quota_cache[acc["email"]] = info
-                elif status == "exhausted":
-                    quota_info = quota_result_quota_info(info)
-                    if quota_info:
-                        quota_cache[acc["email"]] = quota_info
+    if not cached:
+        active_count = sum(
+            1 for a in accounts if a["status"] == STATUS_ACTIVE and a.get("auth_file") and Path(a["auth_file"]).exists()
+        )
+        if active_count:
+            logger.info("[状态] 查询 %d 个 active 账号额度...", active_count)
+        for acc in accounts:
+            if acc["status"] == STATUS_ACTIVE and acc.get("auth_file") and Path(acc["auth_file"]).exists():
+                auth_data = json.loads(read_text(Path(acc["auth_file"])))
+                access_token = auth_data.get("access_token")
+                if access_token:
+                    status, info = check_codex_quota(access_token)
+                    if status == "ok" and isinstance(info, dict):
+                        quota_cache[acc["email"]] = info
+                    elif status == "exhausted":
+                        quota_info = quota_result_quota_info(info)
+                        if quota_info:
+                            quota_cache[acc["email"]] = quota_info
 
     _print_status_table(accounts, quota_cache)
 
@@ -2263,7 +2267,8 @@ def main():
     )
     sub = parser.add_subparsers(dest="command", help="可用命令")
 
-    sub.add_parser("status", help="查看所有账号状态")
+    status_p = sub.add_parser("status", help="查看所有账号状态")
+    status_p.add_argument("--cached", action="store_true", help="只读本地缓存，跳过配置验证和 Team 同步")
     sub.add_parser("check", help="检查活跃账号 Codex 额度")
     rotate_p = sub.add_parser("rotate", help="智能轮转（检查额度 → 移出 → 复用旧号 → 万不得已才创建新号）")
     rotate_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
@@ -2295,7 +2300,8 @@ def main():
         sys.exit(0)
 
     # 首次启动检查必填配置（api 命令在 start_server 里单独处理）
-    if args.command not in ("api",):
+    skip_setup_check = args.command == "status" and getattr(args, "cached", False)
+    if args.command not in ("api",) and not skip_setup_check:
         from autoteam.setup_wizard import check_and_setup
 
         check_and_setup(interactive=True)
@@ -2308,7 +2314,7 @@ def main():
         pass
 
     if args.command == "status":
-        cmd_status()
+        cmd_status(cached=getattr(args, "cached", False))
     elif args.command == "check":
         cmd_check()
     elif args.command == "rotate":
