@@ -515,6 +515,61 @@ def sync_from_cpa():
     }
 
 
+def _repair_broken_auth_paths(accounts):
+    """修复本地账号记录中已失效的 auth_file 路径。"""
+    changed = False
+    for acc in accounts:
+        auth_path = acc.get("auth_file")
+        if auth_path and not Path(auth_path).exists():
+            matches = list(AUTH_DIR.glob(f"codex-{acc['email']}-*.json"))
+            if matches:
+                acc["auth_file"] = str(matches[0].resolve())
+                changed = True
+    return changed
+
+
+def sync_active_account_to_cpa(email):
+    """仅上传单个 active 账号的认证文件，不执行删除，供轮转过程即时增量同步。"""
+    from autoteam.accounts import STATUS_ACTIVE, find_account, load_accounts, save_accounts
+
+    email = (email or "").strip().lower()
+    if not email:
+        logger.warning("[CPA] 即时上传失败：缺少账号邮箱")
+        return False
+
+    accounts = load_accounts()
+    local_duplicates_deleted, accounts_path_repaired = _cleanup_local_duplicates(accounts)
+    if accounts_path_repaired:
+        save_accounts(accounts)
+
+    if _repair_broken_auth_paths(accounts):
+        save_accounts(accounts)
+
+    acc = find_account(accounts, email)
+    if not acc:
+        logger.warning("[CPA] 即时上传失败：本地账号不存在: %s", email)
+        return False
+    if acc.get("status") != STATUS_ACTIVE:
+        logger.warning("[CPA] 即时上传跳过：账号不是 active: %s (%s)", email, acc.get("status"))
+        return False
+
+    auth_path = acc.get("auth_file")
+    if not auth_path:
+        logger.warning("[CPA] 即时上传跳过：账号缺少 auth_file: %s", email)
+        return False
+
+    path = Path(auth_path)
+    if not path.exists():
+        logger.warning("[CPA] 即时上传跳过：认证文件不存在: %s -> %s", email, auth_path)
+        return False
+
+    logger.info("[CPA] 即时上传账号认证: %s -> %s", email, path.name)
+    if upload_to_cpa(path):
+        logger.info("[CPA] 即时上传完成: %s（本地去重 %d）", email, local_duplicates_deleted)
+        return True
+    return False
+
+
 def sync_to_cpa():
     """
     同步本地认证文件到 CPA，只同步 active 状态的账号。
@@ -530,15 +585,7 @@ def sync_to_cpa():
         save_accounts(accounts)
 
     # 修复断裂的 auth_file 路径
-    changed = False
-    for acc in accounts:
-        auth_path = acc.get("auth_file")
-        if auth_path and not Path(auth_path).exists():
-            matches = list(AUTH_DIR.glob(f"codex-{acc['email']}-*.json"))
-            if matches:
-                acc["auth_file"] = str(matches[0].resolve())
-                changed = True
-    if changed:
+    if _repair_broken_auth_paths(accounts):
         save_accounts(accounts)
 
     # active 账号的认证文件

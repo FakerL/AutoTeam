@@ -61,3 +61,33 @@ def test_cmd_rotate_skips_google_accounts_during_auto_reuse(monkeypatch):
         ("sync_to_cpa", None),
     ]
     assert chatgpt.stopped == 1
+
+
+def test_cmd_rotate_uploads_each_joined_account_before_final_sync(monkeypatch):
+    events = []
+    member_counts = iter([0, 2])
+
+    monkeypatch.setattr(manager, "sync_account_states", lambda: events.append("sync-state"))
+    monkeypatch.setattr(manager, "cmd_check", lambda: events.append("check"))
+    monkeypatch.setattr(manager, "load_accounts", lambda: [])
+    monkeypatch.setattr(manager, "get_standby_accounts", lambda: [{"email": "reuse@example.com"}])
+    monkeypatch.setattr(manager, "reinvite_account", lambda _chatgpt, _mail_client, _acc: events.append("reuse") or True)
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda _chatgpt, _mail_client: events.append("create") or "new@example.com",
+    )
+    monkeypatch.setattr(
+        manager,
+        "sync_active_account_to_cpa",
+        lambda email: events.append(f"upload:{email}") or True,
+    )
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append("final-sync"))
+    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: next(member_counts))
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", _FakeChatGPT)
+    monkeypatch.setattr(manager, "CloudMailClient", _FakeMailClient)
+
+    manager.cmd_rotate(target_seats=2)
+
+    assert events.index("reuse") < events.index("upload:reuse@example.com") < events.index("create")
+    assert events.index("create") < events.index("upload:new@example.com") < events.index("final-sync")

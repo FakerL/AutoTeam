@@ -58,7 +58,7 @@ from autoteam.codex_auth import (
     save_auth_file,
 )
 from autoteam.config import get_playwright_launch_options
-from autoteam.cpa_sync import sync_from_cpa, sync_main_codex_to_cpa, sync_to_cpa
+from autoteam.cpa_sync import sync_active_account_to_cpa, sync_from_cpa, sync_main_codex_to_cpa, sync_to_cpa
 from autoteam.textio import read_text, write_text
 
 logger = logging.getLogger(__name__)
@@ -1647,16 +1647,15 @@ def cmd_rotate(target_seats=5):
                 logger.info("[4/5] Team 已满 (%d/%d)", current_count, TARGET)
             return
 
-        logger.info("[4/5] 填补 %d 个空缺 (当前 %d/%d)...", vacancies, current_count, TARGET)
+        logger.info("[4/5] 规划补位方案 (当前 %d/%d，空缺 %d)...", current_count, TARGET, vacancies)
 
-        # 优先复用旧账号（先验证额度是否真的恢复了）
-        filled = 0
         standby_list = [a for a in get_standby_accounts() if not _is_main_account_email(a.get("email"))]
+        reuse_plan = []
         quota_skipped = []
         auto_reuse_skipped = []
 
         for acc in standby_list:
-            if filled >= vacancies:
+            if len(reuse_plan) >= vacancies:
                 break
             email = acc["email"]
             auth_file = acc.get("auth_file")
@@ -1742,12 +1741,30 @@ def cmd_rotate(target_seats=5):
                         quota_skipped.append(acc)
                         continue
 
-            logger.info("[4/5] 复用: %s", email)
+            reuse_plan.append(acc)
+
+        planned_creates = max(0, vacancies - len(reuse_plan))
+        logger.info("[4/5] 补位计划已生成：复用 %d 个旧号，新建 %d 个账号", len(reuse_plan), planned_creates)
+        if reuse_plan:
+            logger.info("[4/5] 计划复用队列: %s", ", ".join(acc["email"] for acc in reuse_plan))
+        if quota_skipped:
+            logger.info("[4/5] 跳过 %d 个额度未恢复的旧号", len(quota_skipped))
+        if auto_reuse_skipped:
+            logger.info("[4/5] 跳过 %d 个暂不支持自动复用的旧号", len(auto_reuse_skipped))
+
+        logger.info("[5/5] 执行补位方案...")
+
+        # 优先复用旧账号（先执行规划好的旧号）
+        filled = 0
+        for index, acc in enumerate(reuse_plan, 1):
+            email = acc["email"]
+            logger.info("[5/5] 复用第 %d/%d 个旧号: %s", index, len(reuse_plan), email)
             if not chatgpt or not chatgpt.browser:
                 ensure_chatgpt()
             if reinvite_account(chatgpt, ensure_mail(), acc):
                 filled += 1
                 current_count += 1
+                sync_active_account_to_cpa(email)
             else:
                 quota_skipped.append(acc)
 
@@ -1755,10 +1772,9 @@ def cmd_rotate(target_seats=5):
             logger.info("[4/5] 跳过 %d 个额度未恢复或复用失败的旧号", len(quota_skipped))
         if auto_reuse_skipped:
             logger.info("[4/5] 跳过 %d 个暂不支持自动复用的旧号", len(auto_reuse_skipped))
-
         remaining = TARGET - current_count
         if remaining <= 0:
-            logger.info("[4/5] 已用旧账号填满空缺")
+            logger.info("[5/5] 已用旧账号填满空缺")
         else:
             # 必须创建新号
             logger.info("[5/5] 创建 %d 个新账号...", remaining)
@@ -1766,8 +1782,10 @@ def cmd_rotate(target_seats=5):
                 logger.info("[5/5] 创建第 %d/%d 个...", i + 1, remaining)
                 if not chatgpt or not chatgpt.browser:
                     ensure_chatgpt()
-                if create_new_account(chatgpt, ensure_mail()):
+                created_email = create_new_account(chatgpt, ensure_mail())
+                if created_email:
                     current_count += 1
+                    sync_active_account_to_cpa(created_email)
 
         if not chatgpt or not chatgpt.browser:
             ensure_chatgpt()
