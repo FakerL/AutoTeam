@@ -371,8 +371,8 @@ def _check_and_refresh(acc):
     return status, info
 
 
-def cmd_check():
-    """只检查 active 账号的额度，无认证文件或 auth_error 的自动重新登录 Codex"""
+def cmd_check(include_exhausted=False):
+    """检查账号额度，无认证文件或 auth_error 的自动重新登录 Codex。"""
     from autoteam.config import AUTO_CHECK_THRESHOLD, CLOUDMAIL_DOMAIN
 
     # API 运行时配置优先（前端可修改）
@@ -437,7 +437,11 @@ def cmd_check():
 
         accounts = load_accounts()
 
-    all_active = [a for a in accounts if a["status"] == STATUS_ACTIVE and not _is_main_account_email(a.get("email"))]
+    target_statuses = {STATUS_ACTIVE}
+    if include_exhausted:
+        target_statuses.add(STATUS_EXHAUSTED)
+
+    all_active = [a for a in accounts if a["status"] in target_statuses and not _is_main_account_email(a.get("email"))]
 
     # 区分：有认证文件的 vs 无认证文件的
     active_with_auth = []
@@ -451,7 +455,10 @@ def cmd_check():
                 no_auth_list.append(a)
 
     if not active_with_auth and not no_auth_list:
-        logger.info("[检查] 没有可检查的 active 账号")
+        if include_exhausted:
+            logger.info("[检查] 没有可检查的 active/exhausted 账号")
+        else:
+            logger.info("[检查] 没有可检查的 active 账号")
         return []
 
     # 检查有认证文件的账号额度
@@ -459,7 +466,8 @@ def cmd_check():
     auth_error_list = []
 
     if active_with_auth:
-        logger.info("[检查] 检查 %d 个 active 账号的额度...", len(active_with_auth))
+        check_label = "active/exhausted" if include_exhausted else "active"
+        logger.info("[检查] 检查 %d 个 %s 账号的额度...", len(active_with_auth), check_label)
         for acc in active_with_auth:
             email = acc["email"]
             status_str, info = _check_and_refresh(acc)
@@ -488,6 +496,14 @@ def cmd_check():
                         )
                         exhausted_list.append(acc)
                     else:
+                        if include_exhausted and acc["status"] == STATUS_EXHAUSTED:
+                            logger.info("[%s] 额度已恢复，恢复为 active", email)
+                            update_account(
+                                email,
+                                status=STATUS_ACTIVE,
+                                quota_exhausted_at=None,
+                                quota_resets_at=None,
+                            )
                         logger.info(
                             "[%s] 额度可用 - 5h剩余: %d%% (重置 %s) | 周剩余: %d%% (重置 %s)",
                             email,
@@ -1424,13 +1440,16 @@ def create_account_direct(mail_client):
     """
     import uuid
 
-    account_id, email = mail_client.create_temp_email()
-    password = f"Tmp_{uuid.uuid4().hex[:12]}!"
-
-    success = False
     for attempt in range(3):
+        account_id, email = mail_client.create_temp_email()
+        password = f"Tmp_{uuid.uuid4().hex[:12]}!"
+
         logger.info("[直接注册] 开始第 %d/3 次注册尝试: %s", attempt + 1, email)
-        success = _register_direct_once(mail_client, email, password, cloudmail_account_id=account_id)
+        success = False
+        try:
+            success = _register_direct_once(mail_client, email, password, cloudmail_account_id=account_id)
+        except Exception as exc:
+            logger.warning("[直接注册] 注册流程异常，准备更换新邮箱重试: %s", exc)
         if success:
             break
 
@@ -1439,16 +1458,17 @@ def create_account_direct(mail_client):
             success = True
             break
 
-        if attempt < 2:
-            logger.warning("[直接注册] 注册失败且账号不在 Team 中，60 秒后重试: %s", email)
-            time.sleep(60)
-
-    if not success:
-        logger.error("[直接注册] 连续 3 次注册失败，删除临时账号: %s", email)
         try:
             mail_client.delete_account(account_id)
         except Exception as exc:
             logger.warning("[直接注册] 删除失败临时邮箱异常: %s", exc)
+
+        if attempt < 2:
+            logger.warning("[直接注册] 注册失败且账号不在 Team 中，60 秒后重试（更换新邮箱）: %s", email)
+            time.sleep(60)
+
+    if not success:
+        logger.error("[直接注册] 连续 3 次注册失败，已清理失败的临时账号")
         return None
 
     add_account(email, password, cloudmail_account_id=account_id)
@@ -1460,10 +1480,10 @@ def create_account_direct(mail_client):
         update_account(email, status=STATUS_ACTIVE, auth_file=auth_file, last_active_at=time.time())
         logger.info("[直接注册] 账号就绪: %s", email)
         return email
-    else:
-        update_account(email, status=STATUS_ACTIVE)
-        logger.warning("[直接注册] 账号已加入 Team 但 Codex 登录失败: %s", email)
-        return email
+
+    update_account(email, status=STATUS_ACTIVE)
+    logger.warning("[直接注册] 账号已加入 Team 但 Codex 登录失败: %s", email)
+    return email
 
 
 def create_new_account(chatgpt_api, mail_client):
@@ -1565,7 +1585,7 @@ def cmd_rotate(target_seats=5):
     sync_account_states()
 
     logger.info("[2/5] 检查额度...")
-    cmd_check()
+    cmd_check(include_exhausted=True)
 
     try:
         # 移出所有 exhausted 账号（包括之前已标记的）

@@ -1533,6 +1533,31 @@ _auto_check_stop = threading.Event()
 _auto_check_restart = threading.Event()  # 配置变更时通知线程重启
 
 
+def _auto_check_exhausted_update(status_str: str, info, threshold: int, *, now: float | None = None) -> dict | None:
+    """构造自动巡检标记 exhausted 时需要持久化的额度字段。"""
+    current_ts = time.time() if now is None else now
+    fields = {"quota_exhausted_at": current_ts}
+
+    if status_str == "ok" and isinstance(info, dict):
+        remaining = 100 - info.get("primary_pct", 0)
+        if remaining >= threshold:
+            return None
+        fields["last_quota"] = info
+        fields["quota_resets_at"] = info.get("primary_resets_at") or int(current_ts + 18000)
+        return fields
+
+    if status_str == "exhausted":
+        from autoteam.codex_auth import quota_result_quota_info, quota_result_resets_at
+
+        quota_info = quota_result_quota_info(info)
+        if quota_info:
+            fields["last_quota"] = quota_info
+        fields["quota_resets_at"] = quota_result_resets_at(info) or int(current_ts + 18000)
+        return fields
+
+    return None
+
+
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
     from autoteam.accounts import STATUS_ACTIVE, load_accounts
@@ -1577,18 +1602,22 @@ def _auto_check_loop():
                     if not access_token:
                         continue
                     status, info = check_codex_quota(access_token)
+                    update_fields = _auto_check_exhausted_update(status, info, cfg["threshold"])
+                    if not update_fields:
+                        continue
+
+                    remaining = 0
                     if status == "ok" and isinstance(info, dict):
                         remaining = 100 - info.get("primary_pct", 0)
-                        if remaining < cfg["threshold"]:
-                            low_accounts.append((acc["email"], remaining))
-                    elif status == "exhausted":
-                        low_accounts.append((acc["email"], 0))
+                    low_accounts.append((acc["email"], remaining, update_fields))
                 except Exception:
                     pass
 
             if low_accounts:
                 logger.info(
-                    "[巡检] %d 个账号额度不足: %s", len(low_accounts), ", ".join(f"{e}({r}%)" for e, r in low_accounts)
+                    "[巡检] %d 个账号额度不足: %s",
+                    len(low_accounts),
+                    ", ".join(f"{email}({remaining}%)" for email, remaining, _fields in low_accounts),
                 )
 
             if len(low_accounts) >= cfg["min_low"]:
@@ -1601,9 +1630,9 @@ def _auto_check_loop():
                 # 将低于阈值的账号标记为 exhausted，rotate 会自动移出并补充
                 from autoteam.accounts import STATUS_EXHAUSTED, update_account
 
-                for email, remaining in low_accounts:
+                for email, remaining, update_fields in low_accounts:
                     logger.info("[巡检] %s 剩余 %d%%，标记为 exhausted", email, remaining)
-                    update_account(email, status=STATUS_EXHAUSTED, quota_exhausted_at=time.time())
+                    update_account(email, status=STATUS_EXHAUSTED, **update_fields)
 
                 logger.info("[巡检] 触发自动轮转...")
                 from autoteam.manager import cmd_rotate

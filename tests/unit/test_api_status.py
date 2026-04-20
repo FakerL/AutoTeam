@@ -102,3 +102,43 @@ def test_post_setup_save_keeps_cpa_url_required_and_generates_api_key(monkeypatc
     assert written["API_KEY"] == "generated-token"
     assert result["api_key"] == "generated-token"
     assert api.API_KEY == "generated-token"
+
+
+def test_auto_check_exhausted_update_persists_low_quota_snapshot():
+    now = 1_710_000_000
+    quota_info = {
+        "primary_pct": 95,
+        "primary_resets_at": now + 1800,
+        "weekly_pct": 12,
+        "weekly_resets_at": now + 7200,
+    }
+
+    fields = api._auto_check_exhausted_update("ok", quota_info, threshold=10, now=now)
+
+    assert fields == {
+        "last_quota": quota_info,
+        "quota_exhausted_at": now,
+        "quota_resets_at": quota_info["primary_resets_at"],
+    }
+
+
+def test_auto_check_exhausted_update_uses_exhausted_window_reset():
+    now = 1_710_000_000
+    exhausted_info = {
+        "window": "weekly",
+        "resets_at": now + 86400,
+        "quota_info": {
+            "primary_pct": 0,
+            "primary_resets_at": now + 1800,
+            "weekly_pct": 100,
+            "weekly_resets_at": now + 86400,
+        },
+    }
+
+    fields = api._auto_check_exhausted_update("exhausted", exhausted_info, threshold=10, now=now)
+
+    assert fields == {
+        "last_quota": exhausted_info["quota_info"],
+        "quota_exhausted_at": now,
+        "quota_resets_at": exhausted_info["resets_at"],
+    }

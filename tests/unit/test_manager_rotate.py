@@ -27,7 +27,11 @@ def test_cmd_rotate_skips_google_accounts_during_auto_reuse(monkeypatch):
     events = []
 
     monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
-    monkeypatch.setattr(manager, "cmd_check", lambda: events.append(("cmd_check", None)))
+    monkeypatch.setattr(
+        manager,
+        "cmd_check",
+        lambda include_exhausted=False: events.append(("cmd_check", include_exhausted)),
+    )
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
     monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
     monkeypatch.setattr(manager, "load_accounts", lambda: [])
@@ -56,7 +60,7 @@ def test_cmd_rotate_skips_google_accounts_during_auto_reuse(monkeypatch):
 
     assert events == [
         ("sync_account_states", None),
-        ("cmd_check", None),
+        ("cmd_check", True),
         ("reinvite", "old-2@example.com"),
         ("sync_to_cpa", None),
     ]
@@ -68,7 +72,11 @@ def test_cmd_rotate_uploads_each_joined_account_before_final_sync(monkeypatch):
     member_counts = iter([0, 2])
 
     monkeypatch.setattr(manager, "sync_account_states", lambda: events.append("sync-state"))
-    monkeypatch.setattr(manager, "cmd_check", lambda: events.append("check"))
+    monkeypatch.setattr(
+        manager,
+        "cmd_check",
+        lambda include_exhausted=False: events.append(f"check:{include_exhausted}"),
+    )
     monkeypatch.setattr(manager, "load_accounts", lambda: [])
     monkeypatch.setattr(manager, "get_standby_accounts", lambda: [{"email": "reuse@example.com"}])
     monkeypatch.setattr(manager, "reinvite_account", lambda _chatgpt, _mail_client, _acc: events.append("reuse") or True)
@@ -89,5 +97,6 @@ def test_cmd_rotate_uploads_each_joined_account_before_final_sync(monkeypatch):
 
     manager.cmd_rotate(target_seats=2)
 
+    assert "check:True" in events
     assert events.index("reuse") < events.index("upload:reuse@example.com") < events.index("create")
     assert events.index("create") < events.index("upload:new@example.com") < events.index("final-sync")
