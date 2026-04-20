@@ -1,4 +1,5 @@
 import json
+import time
 
 from autoteam import api
 
@@ -67,6 +68,47 @@ def test_sanitize_account_keeps_exportable_main_account_active_without_live_quot
 
     assert sanitized["is_main_account"] is True
     assert sanitized["status"] == "active"
+
+
+def test_sanitize_account_marks_standby_with_unreset_weekly_exhaustion_as_exhausted(monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(api, "_is_main_account_email", lambda email: False)
+
+    sanitized = api._sanitize_account(
+        {
+            "email": "standby@example.com",
+            "status": "standby",
+            "last_quota": {
+                "primary_pct": 0,
+                "primary_resets_at": now - 300,
+                "weekly_pct": 100,
+                "weekly_resets_at": now + 3600,
+            },
+        }
+    )
+
+    assert sanitized["is_main_account"] is False
+    assert sanitized["status"] == "exhausted"
+
+
+def test_sanitize_account_keeps_standby_when_exhausted_snapshot_has_expired(monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(api, "_is_main_account_email", lambda email: False)
+
+    sanitized = api._sanitize_account(
+        {
+            "email": "standby@example.com",
+            "status": "standby",
+            "last_quota": {
+                "primary_pct": 0,
+                "primary_resets_at": now - 300,
+                "weekly_pct": 100,
+                "weekly_resets_at": now - 60,
+            },
+        }
+    )
+
+    assert sanitized["status"] == "standby"
 
 
 def test_post_setup_save_keeps_cpa_url_required_and_generates_api_key(monkeypatch):

@@ -364,18 +364,9 @@ def _is_main_account_email(email: str | None) -> bool:
 
 
 def _quota_snapshot_status(quota_info: dict | None) -> str:
-    if not isinstance(quota_info, dict):
-        return ""
+    from autoteam.accounts import quota_snapshot_display_status
 
-    values = []
-    for key in ("primary_pct", "weekly_pct"):
-        value = quota_info.get(key)
-        if isinstance(value, (int, float)):
-            values.append(value)
-
-    if not values:
-        return ""
-    return "exhausted" if any(value >= 100 for value in values) else "active"
+    return quota_snapshot_display_status(quota_info)
 
 
 def _resolve_status_auth_file(acc: dict) -> str:
@@ -394,15 +385,22 @@ def _resolve_status_auth_file(acc: dict) -> str:
 
 
 def _display_account_status(acc: dict, quota_snapshot: dict | None = None) -> str:
+    from autoteam.accounts import STATUS_ACTIVE, STATUS_EXHAUSTED
+
     status = acc.get("status", "")
+    quota_status = _quota_snapshot_status(quota_snapshot) or _quota_snapshot_status(acc.get("last_quota"))
+    if quota_status == STATUS_EXHAUSTED:
+        return STATUS_EXHAUSTED
+
     if not _is_main_account_email(acc.get("email")):
+        if status == STATUS_EXHAUSTED and quota_status == STATUS_ACTIVE:
+            return STATUS_ACTIVE
         return status
 
-    quota_status = _quota_snapshot_status(quota_snapshot) or _quota_snapshot_status(acc.get("last_quota"))
     if quota_status:
         return quota_status
 
-    return "active" if _resolve_status_auth_file(acc) else status
+    return STATUS_ACTIVE if _resolve_status_auth_file(acc) else status
 
 
 def _sanitize_account(acc: dict, quota_snapshot: dict | None = None) -> dict:

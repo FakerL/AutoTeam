@@ -1,6 +1,57 @@
 import sys
+import time
 
 from autoteam import manager
+
+
+def test_display_account_status_marks_standby_with_unreset_weekly_exhaustion_as_exhausted():
+    now = int(time.time())
+    status = manager._display_account_status(
+        {
+            "email": "standby@example.com",
+            "status": manager.STATUS_STANDBY,
+            "last_quota": {
+                "primary_pct": 0,
+                "primary_resets_at": now - 300,
+                "weekly_pct": 100,
+                "weekly_resets_at": now + 3600,
+            },
+        }
+    )
+
+    assert status == manager.STATUS_EXHAUSTED
+
+
+def test_print_status_table_counts_derived_exhausted_status(monkeypatch):
+    now = int(time.time())
+    printed = []
+
+    class FakeConsole:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def print(self, value=""):
+            printed.append(value)
+
+    monkeypatch.setattr("rich.console.Console", FakeConsole)
+
+    manager._print_status_table(
+        [
+            {
+                "email": "standby@example.com",
+                "status": manager.STATUS_STANDBY,
+                "last_quota": {
+                    "primary_pct": 0,
+                    "primary_resets_at": now - 300,
+                    "weekly_pct": 100,
+                    "weekly_resets_at": now + 3600,
+                },
+            }
+        ]
+    )
+
+    assert "✗ 用完 1" in printed[-1]
+    assert "○ 待命 0" in printed[-1]
 
 
 def test_cmd_status_cached_skips_team_sync_and_live_quota(monkeypatch):

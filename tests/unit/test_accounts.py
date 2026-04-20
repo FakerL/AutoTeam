@@ -45,6 +45,30 @@ def test_get_active_accounts_excludes_main_account(tmp_path, monkeypatch):
     assert [item["email"] for item in active] == ["member@example.com"]
 
 
+def test_quota_snapshot_display_status_marks_unreset_weekly_exhaustion_as_exhausted():
+    now = int(time.time())
+    quota_info = {
+        "primary_pct": 0,
+        "primary_resets_at": now - 300,
+        "weekly_pct": 100,
+        "weekly_resets_at": now + 3600,
+    }
+
+    assert accounts.quota_snapshot_display_status(quota_info, now=now) == accounts.STATUS_EXHAUSTED
+
+
+def test_quota_snapshot_display_status_ignores_expired_exhausted_snapshot():
+    now = int(time.time())
+    quota_info = {
+        "primary_pct": 0,
+        "primary_resets_at": now - 300,
+        "weekly_pct": 100,
+        "weekly_resets_at": now - 60,
+    }
+
+    assert accounts.quota_snapshot_display_status(quota_info, now=now) == accounts.STATUS_ACTIVE
+
+
 def test_get_standby_accounts_orders_recovered_first_and_skips_main_account(tmp_path, monkeypatch):
     accounts_file = tmp_path / "accounts.json"
     rotation_state_file = tmp_path / "rotation_state.json"

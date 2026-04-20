@@ -26,6 +26,24 @@ def _is_main_account_email(email):
     return bool(_normalized_email(email)) and _normalized_email(email) == _normalized_email(get_admin_email())
 
 
+def quota_snapshot_display_status(quota_info, *, now=None):
+    """根据额度快照推导展示状态；已过重置时间的历史耗尽快照不再显示为 exhausted。"""
+    if not isinstance(quota_info, dict):
+        return ""
+
+    from autoteam.codex_auth import get_quota_exhausted_info, quota_result_resets_at
+
+    exhausted_info = get_quota_exhausted_info(quota_info)
+    if exhausted_info:
+        current_ts = time.time() if now is None else now
+        resets_at = quota_result_resets_at(exhausted_info)
+        if not resets_at or current_ts < resets_at:
+            return STATUS_EXHAUSTED
+
+    has_quota_values = any(isinstance(quota_info.get(key), (int, float)) for key in ("primary_pct", "weekly_pct"))
+    return STATUS_ACTIVE if has_quota_values else ""
+
+
 def load_accounts():
     """加载账号列表"""
     if ACCOUNTS_FILE.exists():

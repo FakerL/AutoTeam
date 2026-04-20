@@ -37,6 +37,7 @@ from autoteam.accounts import (
     find_account,
     get_standby_accounts,
     load_accounts,
+    quota_snapshot_display_status,
     save_accounts,
     update_account,
 )
@@ -244,10 +245,12 @@ def _print_status_table(accounts, quota_cache=None):
         STATUS_PENDING: ("dim", "… pending"),
     }
 
+    display_statuses = []
     for idx, acc in enumerate(accounts, 1):
         email = acc["email"]
         qi = quota_cache.get(email) or acc.get("last_quota")
-        status = acc["status"]
+        status = _display_account_status(acc, qi)
+        display_statuses.append(status)
 
         style, status_label = STATUS_STYLE.get(status, ("dim", status))
         status_text = Text(status_label, style=style)
@@ -287,15 +290,25 @@ def _print_status_table(accounts, quota_cache=None):
     console.print(table)
 
     # 统计摘要
-    active = sum(1 for a in accounts if a["status"] == STATUS_ACTIVE)
-    standby = sum(1 for a in accounts if a["status"] == STATUS_STANDBY)
-    exhausted = sum(1 for a in accounts if a["status"] == STATUS_EXHAUSTED)
+    active = sum(1 for status in display_statuses if status == STATUS_ACTIVE)
+    standby = sum(1 for status in display_statuses if status == STATUS_STANDBY)
+    exhausted = sum(1 for status in display_statuses if status == STATUS_EXHAUSTED)
     console.print(
         f"  [green]● 活跃 {active}[/]  "
         f"[yellow]○ 待命 {standby}[/]  "
         f"[red]✗ 用完 {exhausted}[/]  "
         f"[dim]总计 {len(accounts)}[/]",
     )
+
+
+def _display_account_status(acc, quota_snapshot=None):
+    status = acc.get("status", "")
+    quota_status = quota_snapshot_display_status(quota_snapshot) or quota_snapshot_display_status(acc.get("last_quota"))
+    if quota_status == STATUS_EXHAUSTED:
+        return STATUS_EXHAUSTED
+    if status == STATUS_EXHAUSTED and quota_status == STATUS_ACTIVE:
+        return STATUS_ACTIVE
+    return status
 
 
 def cmd_status(cached: bool = False):
