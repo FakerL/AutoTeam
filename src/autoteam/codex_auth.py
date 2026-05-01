@@ -76,6 +76,8 @@ def _classify_oauth_failure(url, body_excerpt=""):
     url = (url or "").lower()
     body = (body_excerpt or "").lower()
 
+    if "account_deactivated" in body or "account_deactivated" in url:
+        return "account_deactivated", "账号已停用 (account_deactivated)", False
     if "add-phone" in url:
         return "add_phone", "需要手机号验证", False
     if "verify you are human" in body or "captcha" in body:
@@ -1569,10 +1571,25 @@ def get_quota_exhausted_info(quota_info, *, limit_reached=False):
     }
 
 
+def _wham_usage_error_code(resp):
+    try:
+        data = resp.json()
+    except Exception:
+        return ""
+
+    if not isinstance(data, dict):
+        return ""
+
+    detail = data.get("detail")
+    if isinstance(detail, dict):
+        return str(detail.get("code") or "")
+    return str(data.get("code") or "")
+
+
 def check_codex_quota(access_token, account_id=None):
     """
     通过 /backend-api/wham/usage 查询 Codex 额度状态，不消耗额度。
-    返回 ("ok", quota_info) | ("exhausted", exhausted_info) | ("auth_error", None)
+    返回 ("ok", quota_info) | ("exhausted", exhausted_info) | ("deactivated_workspace", info) | ("auth_error", None)
     quota_info = {"primary_pct": int, "primary_resets_at": int, "weekly_pct": int, "weekly_resets_at": int}
     """
     import requests
@@ -1602,6 +1619,9 @@ def check_codex_quota(access_token, account_id=None):
 
     if resp.status_code != 200:
         logger.error("[Codex] wham/usage 异常: %d %s", resp.status_code, resp.text[:200])
+        code = _wham_usage_error_code(resp)
+        if resp.status_code == 402 and code == "deactivated_workspace":
+            return "deactivated_workspace", {"code": code, "status_code": resp.status_code}
         return "auth_error", None
 
     try:

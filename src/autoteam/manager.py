@@ -93,8 +93,9 @@ def _chatgpt_session_ready(chatgpt_api) -> bool:
     return bool(getattr(chatgpt_api, "browser", None))
 
 
-AUTH_REPAIR_HARD_FAILURE_TYPES = {"human_verification"}
-AUTH_REPAIR_SINGLE_ATTEMPT_FAILURE_TYPES = {"add_phone", "human_verification"}
+ACCOUNT_DEACTIVATION_FAILURE_TYPES = {"account_deactivated", "deactivated_workspace"}
+AUTH_REPAIR_HARD_FAILURE_TYPES = {"human_verification", *ACCOUNT_DEACTIVATION_FAILURE_TYPES}
+AUTH_REPAIR_SINGLE_ATTEMPT_FAILURE_TYPES = {"add_phone", "human_verification", *ACCOUNT_DEACTIVATION_FAILURE_TYPES}
 
 
 def _normalized_email(value: str | None) -> str:
@@ -273,6 +274,8 @@ def _auth_repair_error_label(error_type: str | None) -> str:
         "workspace_selection": "workspace 选择未完成",
         "login_state_lost": "登录态丢失",
         "site_unavailable": "站点不可用/代理异常",
+        "account_deactivated": "账号已停用",
+        "deactivated_workspace": "workspace 已停用",
         "token_exchange_failed": "token 交换失败",
         "non_team_plan": "未进入 Team workspace",
         "auth_code_missing": "未获取到 auth code",
@@ -827,6 +830,41 @@ def _check_and_refresh(acc):
     return status, info
 
 
+def _mark_deactivated_account(email: str, error_type: str = "account_deactivated", detail: str | None = None):
+    update_account(
+        email,
+        auth_last_error=error_type,
+        auth_last_error_detail=detail or _auth_repair_error_label(error_type),
+        auth_last_failed_at=time.time(),
+        auth_retry_after=None,
+        auth_retry_paused=True,
+    )
+
+
+def _mark_deactivated_workspace(email: str, info: dict | None = None):
+    detail = "workspace 已停用 (deactivated_workspace)"
+    if isinstance(info, dict) and info.get("status_code"):
+        detail = f"workspace 已停用 (deactivated_workspace, HTTP {info.get('status_code')})"
+    update_account(
+        email,
+        auth_last_error="deactivated_workspace",
+        auth_last_error_detail=detail,
+        auth_last_failed_at=time.time(),
+        auth_retry_after=None,
+        auth_retry_paused=True,
+    )
+
+
+def _is_account_marked_deactivated(acc: dict | None) -> bool:
+    acc = acc or {}
+    if acc.get("deactivated_workspace") is True:
+        return True
+    if str(acc.get("auth_last_error") or "").strip().lower() in ACCOUNT_DEACTIVATION_FAILURE_TYPES:
+        return True
+    detail = str(acc.get("auth_last_error_detail") or "").lower()
+    return any(token in detail for token in ACCOUNT_DEACTIVATION_FAILURE_TYPES)
+
+
 def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_accounts=None):
     """检查可用账号额度，并尝试修复 Team 内认证未就绪的账号"""
     from autoteam.config import AUTO_CHECK_THRESHOLD
@@ -1034,6 +1072,9 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
                     quota_resets_at=resets_at,
                 )
                 exhausted_list.append(acc)
+            elif status_str == "deactivated_workspace":
+                logger.error("[%s] Codex workspace 已停用，标记为 deactivated_workspace，跳过自动重新登录", email)
+                _mark_deactivated_workspace(email, info)
             elif status_str == "auth_error":
                 # token 失效，先看历史额度（重置时间已过的不算）
                 lq = acc.get("last_quota")
@@ -1145,6 +1186,9 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
                     _auth_repair_reset(email)
                     update_account(email, status=STATUS_ACTIVE, last_active_at=time.time())
                     logger.info("[%s] 额度可用", email)
+                elif status_str == "deactivated_workspace":
+                    logger.error("[%s] Codex workspace 已停用，标记为 deactivated_workspace", email)
+                    _mark_deactivated_workspace(email, info)
                 elif status_str == "auth_error":
                     result = _record_auth_repair_failure(
                         email,
@@ -2306,6 +2350,10 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
                             logger.info("%s 跳过 %s（剩余 %d%% < %d%%）", stage_label, email, p_remain, threshold)
                             return "quota_skip"
                         quota_ok = True
+                    if status_str == "deactivated_workspace":
+                        logger.info("%s 跳过 %s（Codex workspace 已停用）", stage_label, email)
+                        _mark_deactivated_workspace(email, info)
+                        return "deactivated"
                     if status_str == "auth_error":
                         logger.info("%s %s 的认证已失效，改用保存的额度信息判断是否可复用", stage_label, email)
             except Exception:
@@ -3163,6 +3211,160 @@ def cmd_reset_quota_recovery():
     return summary
 
 
+def cmd_delete_deactivated(dry_run=False, remove_remote=True, remove_cloudmail=True):
+    """通过登录流程识别并删除已停用的托管非主号账号。"""
+    accounts = load_accounts()
+    summary = {
+        "total_accounts": 0,
+        "probed_accounts": 0,
+        "matched_accounts": 0,
+        "deleted_accounts": 0,
+        "failed_accounts": 0,
+        "skipped_accounts": 0,
+        "dry_run": bool(dry_run),
+    }
+
+    if not accounts:
+        logger.info("[停用账号] 本地无账号记录")
+        return summary
+
+    deactivated = []
+    mail_clients = {}
+    mail_domain = get_mail_domain()
+    mail_domain_suffix = mail_domain.lstrip("@") if mail_domain else ""
+
+    for acc in accounts:
+        email = acc.get("email", "")
+        if not email or _is_main_account_email(email):
+            continue
+
+        summary["total_accounts"] += 1
+        if _is_account_marked_deactivated(acc):
+            deactivated.append((acc, "local marker"))
+            continue
+
+        if not _can_attempt_auth_repair(acc, mail_domain_suffix):
+            summary["skipped_accounts"] += 1
+            logger.info("[停用账号] 跳过 %s（缺少可自动读取验证码的邮箱绑定）", email)
+            continue
+
+        try:
+            provider = get_account_mail_provider(acc)
+            mail_client = mail_clients.get(provider)
+            if mail_client is None:
+                mail_client = _get_account_mail_client(acc)
+                mail_client.login()
+                mail_clients[provider] = mail_client
+        except Exception as exc:
+            summary["failed_accounts"] += 1
+            logger.warning("[停用账号] 初始化 %s 的邮箱客户端失败: %s", email, exc)
+            continue
+
+        summary["probed_accounts"] += 1
+        login_result = _login_codex_with_result(
+            email,
+            acc.get("password", ""),
+            mail_client=mail_client,
+            max_attempts=1,
+        )
+        error_type = str(login_result.get("error_type") or "")
+        if error_type in ACCOUNT_DEACTIVATION_FAILURE_TYPES:
+            detail = login_result.get("error_detail") or _auth_repair_error_label(error_type)
+            _mark_deactivated_account(email, error_type, detail)
+            deactivated.append((acc, detail))
+        elif login_result.get("ok"):
+            logger.info("[停用账号] %s 登录检查通过，未停用", email)
+        else:
+            logger.info(
+                "[停用账号] %s 登录检查未确认停用，保留账号（%s: %s）",
+                email,
+                _auth_repair_error_label(error_type),
+                login_result.get("error_detail") or "",
+            )
+
+    summary["matched_accounts"] = len(deactivated)
+
+    if not deactivated:
+        logger.info(
+            "[停用账号] 未发现已停用账号（扫描 %d，登录探测 %d，跳过 %d）",
+            summary["total_accounts"],
+            summary["probed_accounts"],
+            summary["skipped_accounts"],
+        )
+        return summary
+
+    logger.info("[停用账号] 发现 %d 个待删除账号:", len(deactivated))
+    for acc, reason in deactivated:
+        logger.info("[停用账号]   %s (%s)", acc.get("email"), reason)
+
+    if dry_run:
+        logger.info("[停用账号] dry-run 模式，不执行删除")
+        return summary
+
+    chatgpt = None
+    remote_state = None
+
+    try:
+        if remove_remote:
+            try:
+                chatgpt = ChatGPTTeamAPI()
+                chatgpt.start()
+                remote_state = fetch_team_state(chatgpt)
+            except Exception as exc:
+                summary["failed_accounts"] += len(deactivated)
+                logger.error("[停用账号] 获取 Team 成员/邀请失败，未执行删除: %s", exc)
+                logger.error("[停用账号] 如只需清理本地记录和同步目标，可使用 delete-deactivated --no-remote")
+                return summary
+
+        for acc, _reason in deactivated:
+            email = acc.get("email", "")
+            mail_client = None
+            if remove_cloudmail:
+                try:
+                    provider = get_account_mail_provider(acc)
+                    mail_client = mail_clients.get(provider)
+                    if mail_client is None:
+                        mail_client = _get_account_mail_client(acc)
+                        mail_client.login()
+                        mail_clients[provider] = mail_client
+                except Exception as exc:
+                    logger.warning("[停用账号] 邮箱客户端初始化失败，仍会删除本地/远端记录: %s", exc)
+                    mail_client = None
+
+            try:
+                cleanup = delete_managed_account(
+                    email,
+                    remove_remote=remove_remote,
+                    remove_cloudmail=remove_cloudmail,
+                    sync_cpa_after=False,
+                    chatgpt_api=chatgpt,
+                    mail_client=mail_client,
+                    remote_state=remote_state,
+                )
+            except Exception as exc:
+                summary["failed_accounts"] += 1
+                logger.error("[停用账号] 删除 %s 失败: %s", email, exc)
+                continue
+
+            if cleanup.get("local_record"):
+                summary["deleted_accounts"] += 1
+                logger.info("[停用账号] 已删除 %s", email)
+
+        if summary["deleted_accounts"]:
+            sync_to_cpa()
+
+        logger.info(
+            "[停用账号] 完成: 匹配 %d，删除 %d，失败 %d",
+            summary["matched_accounts"],
+            summary["deleted_accounts"],
+            summary["failed_accounts"],
+        )
+        return summary
+    finally:
+        if _chatgpt_session_ready(chatgpt):
+            chatgpt.stop()
+
+
 def cmd_pull_cpa():
     """从 CPA 反向同步认证文件到本地。"""
     result = sync_from_cpa()
@@ -3205,6 +3407,11 @@ def main():
     cleanup_p.add_argument("max_seats", type=int, nargs="?", default=None, help="最大席位数")
 
     sub.add_parser("reset-quota", help="清空本地额度恢复记录，并把 exhausted 账号恢复为可检查状态")
+
+    delete_deactivated_p = sub.add_parser("delete-deactivated", help="删除 Codex workspace 已停用的托管账号")
+    delete_deactivated_p.add_argument("--dry-run", action="store_true", help="只扫描并列出账号，不执行删除")
+    delete_deactivated_p.add_argument("--no-remote", action="store_true", help="不移除 Team 成员/邀请")
+    delete_deactivated_p.add_argument("--keep-mail", action="store_true", help="保留邮箱提供者中的临时邮箱账号")
 
     sub.add_parser("sync", help="手动同步认证文件到已启用远端")
     sub.add_parser("pull-cpa", help="从 CPA 反向同步认证文件到本地")
@@ -3254,6 +3461,12 @@ def main():
         cmd_cleanup(args.max_seats)
     elif args.command == "reset-quota":
         cmd_reset_quota_recovery()
+    elif args.command == "delete-deactivated":
+        cmd_delete_deactivated(
+            dry_run=args.dry_run,
+            remove_remote=not args.no_remote,
+            remove_cloudmail=not args.keep_mail,
+        )
     elif args.command == "sync":
         sync_to_cpa()
     elif args.command == "pull-cpa":
